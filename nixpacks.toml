@@ -1,8 +1,0 @@
-[providers]
-python = "3.11"
-
-[phases.setup]
-aptPkgs = ['ffmpeg']
-
-[start]
-cmd = 'python main.py'
