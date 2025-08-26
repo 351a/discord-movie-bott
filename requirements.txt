@@ -1,3 +1,4 @@
-discord.py[voice]
-aiohttp
-PyNaCl
+discord.py==2.3.2
+aiohttp==3.8.5
+asyncio
+PyNaCl==1.5.0
