@@ -5,7 +5,7 @@ import os
 import json
 from typing import Dict, List
 import aiohttp
-import subprocess
+import re
 import logging
 
 # Configure logging
@@ -21,57 +21,78 @@ bot = commands.Bot(command_prefix='/', intents=intents)
 
 # Configuration - Use environment variables for Railway
 BOT_TOKEN = os.getenv("DISCORD_TOKEN") or "YOUR_BOT_TOKEN_HERE"
-# Movie files should be in the same directory as your bot or in a 'movies' folder
-MOVIES_FOLDER = "./movies/"  # Local folder for movie files
-MOVIE_LIST_FILE = "movies.json"  # Local file containing movie list and URLs
+MOVIE_LIST_FILE = "movies.json"  # JSON file containing movie list and Google Drive URLs
 
 class MovieBot:
     def __init__(self):
-        self.current_streams: Dict[int, subprocess.Popen] = {}  # guild_id -> process
+        self.current_streams: Dict[int, any] = {}  # guild_id -> voice_client
         self.movie_list = self.load_movie_list()
     
     def load_movie_list(self) -> Dict[str, str]:
-        """Load movie list from JSON file or scan movies folder"""
+        """Load movie list from JSON file or create default"""
         try:
             with open(MOVIE_LIST_FILE, 'r') as f:
                 return json.load(f)
         except FileNotFoundError:
-            # Scan movies folder for files
-            movie_dict = {}
-            if os.path.exists(MOVIES_FOLDER):
-                for filename in os.listdir(MOVIES_FOLDER):
-                    if filename.lower().endswith(('.mp4', '.mkv', '.avi', '.mov', '.wmv', '.flv')):
-                        movie_name = os.path.splitext(filename)[0].lower().replace(" ", "")
-                        movie_path = os.path.join(MOVIES_FOLDER, filename)
-                        movie_dict[movie_name] = movie_path
-            else:
-                # Create movies folder and default structure
-                os.makedirs(MOVIES_FOLDER, exist_ok=True)
-                logger.info(f"Created movies folder: {MOVIES_FOLDER}")
-                logger.info("Please upload your movie files to the movies folder!")
-            
-            self.save_movie_list(movie_dict)
-            return movie_dict
+            # Create default movie list with example Google Drive links
+            default_movies = {
+                # Add your Google Drive links here
+                # Format: "moviename": "https://drive.google.com/uc?id=FILE_ID"
+            }
+            self.save_movie_list(default_movies)
+            logger.info(f"Created {MOVIE_LIST_FILE}. Add movies using /add_movie command.")
+            return default_movies
     
     def save_movie_list(self, movie_list: Dict[str, str]):
         """Save movie list to JSON file"""
         with open(MOVIE_LIST_FILE, 'w') as f:
             json.dump(movie_list, f, indent=2)
     
+    def convert_drive_url(self, url: str) -> str:
+        """Convert Google Drive share URL to direct download URL"""
+        # Extract file ID from various Google Drive URL formats
+        patterns = [
+            r'https://drive\.google\.com/file/d/([a-zA-Z0-9_-]+)',
+            r'https://drive\.google\.com/open\?id=([a-zA-Z0-9_-]+)',
+            r'https://docs\.google\.com/.*?/d/([a-zA-Z0-9_-]+)'
+        ]
+        
+        for pattern in patterns:
+            match = re.search(pattern, url)
+            if match:
+                file_id = match.group(1)
+                return f"https://drive.google.com/uc?export=download&id={file_id}"
+        
+        # If already a direct download URL or different format, return as-is
+        return url
+    
     def get_movie_url(self, movie_name: str) -> str:
         """Get movie URL by name (case insensitive)"""
-        movie_name = movie_name.lower().replace(" ", "")
-        return self.movie_list.get(movie_name)
+        movie_name = movie_name.lower().replace(" ", "").replace("-", "")
+        for key, url in self.movie_list.items():
+            if key.lower().replace(" ", "").replace("-", "") == movie_name:
+                return self.convert_drive_url(url)
+        return None
     
     def list_movies(self) -> List[str]:
         """Get list of available movies"""
         return list(self.movie_list.keys())
+    
+    async def verify_url(self, url: str) -> bool:
+        """Verify if the Google Drive URL is accessible"""
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.head(url, allow_redirects=True) as response:
+                    return response.status in [200, 206]  # 206 for partial content
+        except:
+            return False
 
 movie_bot = MovieBot()
 
 @bot.event
 async def on_ready():
     logger.info(f'{bot.user} has connected to Discord!')
+    logger.info(f'Bot is in {len(bot.guilds)} guilds')
     
     # Sync slash commands
     try:
@@ -80,7 +101,7 @@ async def on_ready():
     except Exception as e:
         logger.error(f"Failed to sync commands: {e}")
 
-@bot.tree.command(name="play", description="Play a movie in voice channel")
+@bot.tree.command(name="play", description="Play a movie from Google Drive in voice channel")
 async def play_movie(interaction: discord.Interaction, movie: str):
     """Play a movie in the user's voice channel"""
     
@@ -89,19 +110,16 @@ async def play_movie(interaction: discord.Interaction, movie: str):
         await interaction.response.send_message("❌ You need to be in a voice channel to use this command!", ephemeral=True)
         return
     
-    # Check if movie file exists locally
-    movie_path = movie_bot.get_movie_url(movie)
-    if not movie_path:
+    # Get movie URL
+    movie_url = movie_bot.get_movie_url(movie)
+    if not movie_url:
         available_movies = ", ".join(movie_bot.list_movies())
+        if not available_movies:
+            available_movies = "No movies available! Use `/add_movie` to add some."
         await interaction.response.send_message(
             f"❌ Movie '{movie}' not found!\n**Available movies:** {available_movies}", 
             ephemeral=True
         )
-        return
-    
-    # Verify file exists
-    if not os.path.exists(movie_path):
-        await interaction.response.send_message(f"❌ Movie file not found: {movie_path}", ephemeral=True)
         return
     
     # Check if bot is already streaming in this guild
@@ -113,21 +131,33 @@ async def play_movie(interaction: discord.Interaction, movie: str):
     await interaction.response.defer()
     
     try:
+        # Verify URL is accessible
+        if not await movie_bot.verify_url(movie_url):
+            await interaction.followup.send("❌ Movie URL is not accessible. Please check the Google Drive link and make sure it's shared publicly.")
+            return
+        
         # Join voice channel
         voice_channel = interaction.user.voice.channel
         voice_client = await voice_channel.connect()
         
-        # Start streaming using FFmpeg with local file
+        # FFmpeg options for streaming from Google Drive
         ffmpeg_options = {
-            'before_options': '-re',  # Read input at native frame rate
-            'options': '-vn -bufsize 64k'  # No video, audio only with buffer
+            'before_options': '-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5 -http_persistent 0',
+            'options': '-vn -bufsize 512k -maxrate 128k'  # Audio only, buffering for stability
         }
         
-        # Create audio source from local file
-        audio_source = discord.FFmpegPCMAudio(movie_path, **ffmpeg_options)
+        # Create audio source from Google Drive URL
+        audio_source = discord.FFmpegPCMAudio(movie_url, **ffmpeg_options)
         
         # Start playing
-        voice_client.play(audio_source, after=lambda e: logger.error(f'Player error: {e}') if e else None)
+        def after_playing(error):
+            if error:
+                logger.error(f'Player error: {error}')
+            # Clean up when finished
+            if guild_id in movie_bot.current_streams:
+                del movie_bot.current_streams[guild_id]
+        
+        voice_client.play(audio_source, after=after_playing)
         
         # Store the voice client reference
         movie_bot.current_streams[guild_id] = voice_client
@@ -137,32 +167,26 @@ async def play_movie(interaction: discord.Interaction, movie: str):
             description=f"**Movie:** {movie.title()}\n**Channel:** {voice_channel.name}",
             color=0x00ff00
         )
+        embed.add_field(name="🎵", value="Streaming audio from Google Drive", inline=False)
         embed.add_field(name="Controls", value="Use `/stop` to stop playback", inline=False)
+        embed.set_footer(text="Note: Only audio is streamed to Discord voice channels")
         
         await interaction.followup.send(embed=embed)
-        
-        # Auto-disconnect when finished
-        while voice_client.is_playing() or voice_client.is_paused():
-            await asyncio.sleep(1)
-        
-        # Clean up
-        if guild_id in movie_bot.current_streams:
-            del movie_bot.current_streams[guild_id]
-        await voice_client.disconnect()
         
     except Exception as e:
         logger.error(f"Error playing movie: {e}")
         if guild_id in movie_bot.current_streams:
             del movie_bot.current_streams[guild_id]
         try:
-            await voice_client.disconnect()
+            if 'voice_client' in locals():
+                await voice_client.disconnect()
         except:
             pass
-        await interaction.followup.send(f"❌ Error playing movie: {str(e)}")
+        await interaction.followup.send(f"❌ Error playing movie: {str(e)}\n*Make sure the Google Drive link is publicly accessible!*")
 
 @bot.tree.command(name="stop", description="Stop current movie playback")
 async def stop_movie(interaction: discord.Interaction):
-    """Stop current movie playbook"""
+    """Stop current movie playback"""
     guild_id = interaction.guild_id
     
     if guild_id not in movie_bot.current_streams:
@@ -187,107 +211,76 @@ async def list_movies(interaction: discord.Interaction):
     movies = movie_bot.list_movies()
     
     if not movies:
-        await interaction.response.send_message("❌ No movies available!", ephemeral=True)
+        embed = discord.Embed(
+            title="🎬 No Movies Available",
+            description="No movies have been added yet!",
+            color=0xff9900
+        )
+        embed.add_field(name="How to add movies:", value="Use `/add_movie <name> <google_drive_url>`", inline=False)
+        embed.add_field(name="Example:", value="`/add_movie Superman https://drive.google.com/file/d/abc123...`", inline=False)
+        await interaction.response.send_message(embed=embed)
         return
     
-    embed = discord.Embed(
-        title="🎬 Available Movies",
-        description="\n".join([f"• {movie.title()}" for movie in movies]),
-        color=0x0099ff
-    )
-    embed.add_field(name="Usage", value="Use `/play <movie_name>` to play a movie", inline=False)
+    # Split movies into chunks if too many
+    movie_chunks = [movies[i:i+20] for i in range(0, len(movies), 20)]
     
-    await interaction.response.send_message(embed=embed)
+    for i, chunk in enumerate(movie_chunks):
+        embed = discord.Embed(
+            title=f"🎬 Available Movies {f'({i+1}/{len(movie_chunks)})' if len(movie_chunks) > 1 else ''}",
+            description="\n".join([f"• **{movie}**" for movie in chunk]),
+            color=0x0099ff
+        )
+        embed.add_field(name="Usage", value="Use `/play <movie_name>` to play a movie", inline=False)
+        
+        if i == 0:  # Only show this on first embed
+            await interaction.response.send_message(embed=embed)
+        else:
+            await interaction.followup.send(embed=embed)
 
-@bot.tree.command(name="add_movie", description="Add a new movie file")
-async def add_movie(interaction: discord.Interaction, name: str, filename: str):
-    """Add a new movie to the available list by filename"""
+@bot.tree.command(name="add_movie", description="Add a new movie from Google Drive")
+async def add_movie(interaction: discord.Interaction, name: str, google_drive_url: str):
+    """Add a new movie to the available list using Google Drive URL"""
     
-    # Check if user has permission (you can modify this check)
+    # Check if user has permission
     if not interaction.user.guild_permissions.administrator:
         await interaction.response.send_message("❌ You need administrator permissions to add movies!", ephemeral=True)
         return
     
-    # Check if file exists in movies folder
-    file_path = os.path.join(MOVIES_FOLDER, filename)
-    if not os.path.exists(file_path):
-        await interaction.response.send_message(f"❌ File '{filename}' not found in movies folder!", ephemeral=True)
+    # Validate URL
+    if "drive.google.com" not in google_drive_url and "docs.google.com" not in google_drive_url:
+        await interaction.response.send_message("❌ Please provide a valid Google Drive URL!", ephemeral=True)
+        return
+    
+    await interaction.response.defer()
+    
+    # Test if URL is accessible
+    converted_url = movie_bot.convert_drive_url(google_drive_url)
+    if not await movie_bot.verify_url(converted_url):
+        embed = discord.Embed(
+            title="⚠️ URL Not Accessible",
+            description="The Google Drive link doesn't seem to be publicly accessible.",
+            color=0xff9900
+        )
+        embed.add_field(
+            name="How to fix:",
+            value="1. Right-click the file in Google Drive\n2. Select 'Share'\n3. Change to 'Anyone with the link'\n4. Set permission to 'Viewer'\n5. Copy the link and try again",
+            inline=False
+        )
+        await interaction.followup.send(embed=embed)
         return
     
     # Add movie to list
-    movie_key = name.lower().replace(" ", "")
-    movie_bot.movie_list[movie_key] = file_path
+    movie_key = name.strip()
+    movie_bot.movie_list[movie_key] = google_drive_url
     movie_bot.save_movie_list(movie_bot.movie_list)
-    
-    await interaction.response.send_message(f"✅ Added movie '{name}' (file: {filename}) to the list!")
-
-@bot.tree.command(name="scan_movies", description="Scan movies folder for new files")
-async def scan_movies(interaction: discord.Interaction):
-    """Scan the movies folder and update the movie list"""
-    
-    if not interaction.user.guild_permissions.administrator:
-        await interaction.response.send_message("❌ You need administrator permissions to scan movies!", ephemeral=True)
-        return
-    
-    if not os.path.exists(MOVIES_FOLDER):
-        await interaction.response.send_message("❌ Movies folder not found!", ephemeral=True)
-        return
-    
-    # Scan for movie files
-    new_movies = []
-    for filename in os.listdir(MOVIES_FOLDER):
-        if filename.lower().endswith(('.mp4', '.mkv', '.avi', '.mov', '.wmv', '.flv')):
-            movie_name = os.path.splitext(filename)[0].lower().replace(" ", "")
-            movie_path = os.path.join(MOVIES_FOLDER, filename)
-            
-            if movie_name not in movie_bot.movie_list:
-                movie_bot.movie_list[movie_name] = movie_path
-                new_movies.append(filename)
-    
-    # Save updated list
-    movie_bot.save_movie_list(movie_bot.movie_list)
-    
-    if new_movies:
-        movie_list = "\n".join([f"• {movie}" for movie in new_movies])
-        await interaction.response.send_message(f"✅ Found {len(new_movies)} new movies:\n{movie_list}")
-    else:
-        await interaction.response.send_message("ℹ️ No new movies found in the folder.")
-
-@bot.tree.command(name="upload_info", description="Get information about uploading movies")
-async def upload_info(interaction: discord.Interaction):
-    """Provide information about uploading movie files"""
     
     embed = discord.Embed(
-        title="📁 How to Upload Movies",
-        description="Instructions for adding movies to the bot",
-        color=0x0099ff
+        title="✅ Movie Added Successfully!",
+        description=f"**{name}** has been added to the movie list.",
+        color=0x00ff00
     )
-    
-    embed.add_field(
-        name="1. Upload Files",
-        value=f"Upload your movie files to the `{MOVIES_FOLDER}` folder on the server",
-        inline=False
-    )
-    
-    embed.add_field(
-        name="2. Supported Formats",
-        value="MP4, MKV, AVI, MOV, WMV, FLV",
-        inline=False
-    )
-    
-    embed.add_field(
-        name="3. Scan for New Files",
-        value="Use `/scan_movies` to detect newly uploaded files",
-        inline=False
-    )
-    
-    embed.add_field(
-        name="4. Manual Addition",
-        value="Use `/add_movie <name> <filename>` to manually add specific files",
-        inline=False
-    )
-    
-    await interaction.response.send_message(embed=embed)
+    embed.add_field(name="Usage", value=f"Use `/play {name}` to stream this movie", inline=False)
+    await interaction.followup.send(embed=embed)
 
 @bot.tree.command(name="remove_movie", description="Remove a movie from the list")
 async def remove_movie(interaction: discord.Interaction, name: str):
@@ -298,21 +291,91 @@ async def remove_movie(interaction: discord.Interaction, name: str):
         await interaction.response.send_message("❌ You need administrator permissions to remove movies!", ephemeral=True)
         return
     
-    movie_key = name.lower().replace(" ", "")
+    # Find movie (case insensitive)
+    movie_key = None
+    for key in movie_bot.movie_list.keys():
+        if key.lower() == name.lower():
+            movie_key = key
+            break
     
-    if movie_key not in movie_bot.movie_list:
+    if not movie_key:
         await interaction.response.send_message(f"❌ Movie '{name}' not found in the list!", ephemeral=True)
         return
     
     del movie_bot.movie_list[movie_key]
     movie_bot.save_movie_list(movie_bot.movie_list)
     
-    await interaction.response.send_message(f"✅ Removed movie '{name}' from the list!")
+    await interaction.response.send_message(f"✅ Removed movie '{movie_key}' from the list!")
+
+@bot.tree.command(name="movie_info", description="Get information about a specific movie")
+async def movie_info(interaction: discord.Interaction, movie: str):
+    """Get information about a specific movie"""
+    
+    # Find movie URL
+    movie_url = None
+    movie_name = None
+    for key, url in movie_bot.movie_list.items():
+        if key.lower().replace(" ", "").replace("-", "") == movie.lower().replace(" ", "").replace("-", ""):
+            movie_url = url
+            movie_name = key
+            break
+    
+    if not movie_url:
+        await interaction.response.send_message(f"❌ Movie '{movie}' not found!", ephemeral=True)
+        return
+    
+    embed = discord.Embed(
+        title=f"🎬 {movie_name}",
+        description="Movie Information",
+        color=0x0099ff
+    )
+    embed.add_field(name="Google Drive URL", value=f"[View File]({movie_url})", inline=False)
+    embed.add_field(name="Direct Stream URL", value=f"[Direct Link]({movie_bot.convert_drive_url(movie_url)})", inline=False)
+    embed.add_field(name="Play Command", value=f"`/play {movie_name}`", inline=False)
+    
+    await interaction.response.send_message(embed=embed)
+
+@bot.tree.command(name="help", description="Show bot help and setup instructions")
+async def help_command(interaction: discord.Interaction):
+    """Show help information"""
+    
+    embed = discord.Embed(
+        title="🎬 Discord Movie Bot Help",
+        description="Stream movies from Google Drive to Discord voice channels!",
+        color=0x0099ff
+    )
+    
+    embed.add_field(
+        name="🎵 Basic Commands",
+        value="`/play <movie>` - Play a movie\n`/stop` - Stop playback\n`/movies` - List available movies",
+        inline=False
+    )
+    
+    embed.add_field(
+        name="🔧 Admin Commands",
+        value="`/add_movie <name> <url>` - Add movie\n`/remove_movie <name>` - Remove movie\n`/movie_info <name>` - Movie details",
+        inline=False
+    )
+    
+    embed.add_field(
+        name="📁 Adding Movies from Google Drive",
+        value="1. Upload video to Google Drive\n2. Right-click → Share → 'Anyone with link'\n3. Copy the share URL\n4. Use `/add_movie MovieName <URL>`",
+        inline=False
+    )
+    
+    embed.add_field(
+        name="⚠️ Important Notes",
+        value="• Only audio is streamed (Discord limitation)\n• Files must be publicly accessible\n• Supported: MP4, MKV, AVI, etc.\n• Bot auto-disconnects when alone",
+        inline=False
+    )
+    
+    embed.set_footer(text="Made for streaming movie audio to Discord voice channels")
+    
+    await interaction.response.send_message(embed=embed)
 
 @bot.event
 async def on_voice_state_update(member, before, after):
-    """Handle voice state updates"""
-    # Auto-disconnect if bot is alone in voice channel
+    """Handle voice state updates - auto disconnect when alone"""
     if member == bot.user:
         return
     
@@ -330,23 +393,41 @@ async def on_voice_state_update(member, before, after):
             await asyncio.sleep(30)  # 30 second delay
             
             # Check again after delay
-            if voice_client.channel:
+            if voice_client.channel and guild_id in movie_bot.current_streams:
                 human_members = [m for m in voice_client.channel.members if not m.bot]
                 if len(human_members) == 0:
                     voice_client.stop()
                     await voice_client.disconnect()
                     if guild_id in movie_bot.current_streams:
                         del movie_bot.current_streams[guild_id]
+                    logger.info(f"Auto-disconnected from empty voice channel in guild {guild_id}")
 
 # Error handling
 @bot.tree.error
 async def on_app_command_error(interaction: discord.Interaction, error: Exception):
     logger.error(f"Command error: {error}")
-    if not interaction.response.is_done():
-        await interaction.response.send_message(f"❌ An error occurred: {str(error)}", ephemeral=True)
-    else:
-        await interaction.followup.send(f"❌ An error occurred: {str(error)}", ephemeral=True)
+    
+    error_msg = "❌ An error occurred!"
+    
+    if "FFmpeg" in str(error):
+        error_msg = "❌ Audio processing error! The movie file might be corrupted or in an unsupported format."
+    elif "HTTP" in str(error):
+        error_msg = "❌ Network error! Check if the Google Drive link is accessible."
+    elif "permission" in str(error).lower():
+        error_msg = "❌ Permission error! Make sure the Google Drive file is shared publicly."
+    
+    try:
+        if not interaction.response.is_done():
+            await interaction.response.send_message(error_msg, ephemeral=True)
+        else:
+            await interaction.followup.send(error_msg, ephemeral=True)
+    except:
+        pass
 
 if __name__ == "__main__":
     # Run the bot
-    bot.run(BOT_TOKEN)
+    if not BOT_TOKEN or BOT_TOKEN == "YOUR_BOT_TOKEN_HERE":
+        logger.error("Please set the DISCORD_TOKEN environment variable!")
+    else:
+        logger.info("Starting Discord Movie Bot...")
+        bot.run(BOT_TOKEN)
