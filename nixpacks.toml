@@ -1,11 +1,8 @@
+[providers]
+python = "3.11"
+
 [phases.setup]
-nixPkgs = ['python39', 'ffmpeg', 'opus']
-
-[phases.install]
-cmds = ['pip install -r requirements.txt']
-
-[phases.build]
-cmds = ['echo "Build complete"']
+aptPkgs = ['ffmpeg']
 
 [start]
 cmd = 'python main.py'
