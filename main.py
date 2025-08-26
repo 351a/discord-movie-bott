@@ -143,131 +143,35 @@ async def on_ready():
     except Exception as e:
         logger.error(f"Failed to sync commands: {e}")
 
-@bot.tree.command(name="play", description="Play a movie from Google Drive in voice channel")
-@app_commands.autocomplete(movie=movie_autocomplete)
-async def play_movie(interaction: discord.Interaction, movie: str):
-    """Play a movie in the user's voice channel"""
-    
-    # Check if user is in a voice channel
-    if not interaction.user.voice or not interaction.user.voice.channel:
-        await interaction.response.send_message("❌ You need to be in a voice channel to use this command!", ephemeral=True)
-        return
-    
-    # Get movie URL and exact name
-    movie_url = movie_bot.get_movie_url(movie)
-    exact_movie_name = movie_bot.find_movie_name(movie)
-    
-    if not movie_url or not exact_movie_name:
-        available_movies = ", ".join(movie_bot.list_movies()[:10])  # Show first 10
-        if not movie_bot.list_movies():
-            available_movies = "No movies available! Use `/add_movie` to add some."
-        elif len(movie_bot.list_movies()) > 10:
-            available_movies += f"... and {len(movie_bot.list_movies()) - 10} more"
-            
-        await interaction.response.send_message(
-            f"❌ Movie '{movie}' not found!\n**Available movies:** {available_movies}\n\n*Use the autocomplete feature by typing movie names!*", 
-            ephemeral=True
-        )
-        return
-    
-    # Check if bot is already streaming in this guild
-    guild_id = interaction.guild_id
-    if guild_id in movie_bot.current_streams:
-        await interaction.response.send_message("❌ Already streaming a movie in this server! Use `/stop` first.", ephemeral=True)
-        return
-    
-    await interaction.response.defer()
-    
-    try:
-        # Verify URL is accessible
-        if not await movie_bot.verify_url(movie_url):
-            await interaction.followup.send("❌ Movie URL is not accessible. Please check the Google Drive link and make sure it's shared publicly.")
-            return
-        
-        # Join voice channel
-        voice_channel = interaction.user.voice.channel
-        voice_client = await voice_channel.connect()
-        
-        # Try to create audio source from Google Drive URL
-        try:
-            # First try with FFmpeg (if available)
-            ffmpeg_options = {
-                'before_options': '-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5 -http_persistent 0',
-                'options': '-vn -bufsize 512k -maxrate 128k'  # Audio only, buffering for stability
-            }
-            audio_source = discord.FFmpegPCMAudio(movie_url, **ffmpeg_options)
-        except Exception as ffmpeg_error:
-            logger.warning(f"FFmpeg not available: {ffmpeg_error}")
-            # Fallback: Just join the channel but don't stream
-            embed = discord.Embed(
-                title="⚠️ Limited Functionality",
-                description=f"**Movie:** {exact_movie_name}\n**Channel:** {voice_channel.name}",
-                color=0xff9900
-            )
-            embed.add_field(name="❌ Audio Streaming Unavailable", value="FFmpeg is not installed on this server. Bot can only join voice channels.", inline=False)
-            embed.add_field(name="Movie URL", value=f"[Click to watch in browser]({movie_url})", inline=False)
-            embed.add_field(name="Controls", value="Use `/stop` to disconnect", inline=False)
-            
-            movie_bot.current_streams[guild_id] = voice_client
-            await interaction.followup.send(embed=embed)
-            return
-        
-        # Start playing
-        def after_playing(error):
-            if error:
-                logger.error(f'Player error: {error}')
-            # Clean up when finished
-            if guild_id in movie_bot.current_streams:
-                del movie_bot.current_streams[guild_id]
-        
-        voice_client.play(audio_source, after=after_playing)
-        
-        # Store the voice client reference
-        movie_bot.current_streams[guild_id] = voice_client
-        
-        embed = discord.Embed(
-            title="🎬 Now Playing",
-            description=f"**Movie:** {exact_movie_name}\n**Channel:** {voice_channel.name}",
-            color=0x00ff00
-        )
-        embed.add_field(name="🎵", value="Streaming audio from Google Drive", inline=False)
-        embed.add_field(name="Controls", value="Use `/stop` to stop playback", inline=False)
-        embed.set_footer(text="Note: Only audio is streamed to Discord voice channels")
-        
-        await interaction.followup.send(embed=embed)
-        
-    except Exception as e:
-        logger.error(f"Error playing movie: {e}")
-        if guild_id in movie_bot.current_streams:
-            del movie_bot.current_streams[guild_id]
-        try:
-            if 'voice_client' in locals():
-                await voice_client.disconnect()
-        except:
-            pass
-        await interaction.followup.send(f"❌ Error playing movie: {str(e)}\n*Server may not have FFmpeg installed for audio streaming*")
 
-@bot.tree.command(name="stop", description="Stop current movie playback")
+
+@bot.tree.command(name="stop", description="End watch party and leave voice channel")
 async def stop_movie(interaction: discord.Interaction):
-    """Stop current movie playback"""
+    """End the watch party and leave voice channel"""
     guild_id = interaction.guild_id
     
     if guild_id not in movie_bot.current_streams:
-        await interaction.response.send_message("❌ No movie is currently playing!", ephemeral=True)
+        await interaction.response.send_message("❌ No watch party is currently active!", ephemeral=True)
         return
     
     try:
         voice_client = movie_bot.current_streams[guild_id]
-        if voice_client.is_playing():
-            voice_client.stop()
+        channel_name = voice_client.channel.name if voice_client.channel else "Unknown"
+        
         await voice_client.disconnect()
         del movie_bot.current_streams[guild_id]
         
-        await interaction.response.send_message("⏹️ Movie playback stopped!")
+        embed = discord.Embed(
+            title="🎬 Watch Party Ended",
+            description=f"Left voice channel: **{channel_name}**\nThanks for watching together! 🍿",
+            color=0xff6b6b
+        )
+        
+        await interaction.response.send_message(embed=embed)
         
     except Exception as e:
-        logger.error(f"Error stopping movie: {e}")
-        await interaction.response.send_message(f"❌ Error stopping movie: {str(e)}")
+        logger.error(f"Error ending watch party: {e}")
+        await interaction.response.send_message(f"❌ Error ending watch party: {str(e)}")
 
 @bot.tree.command(name="movies", description="List available movies")
 async def list_movies(interaction: discord.Interaction):
@@ -294,7 +198,7 @@ async def list_movies(interaction: discord.Interaction):
             description="\n".join([f"• **{movie}**" for movie in chunk]),
             color=0x0099ff
         )
-        embed.add_field(name="Usage", value="Use `/play <movie_name>` to play a movie (with autocomplete!)", inline=False)
+        embed.add_field(name="Usage", value="Use `/play <movie_name>` to start a watch party (with autocomplete!)", inline=False)
         embed.add_field(name="Total Movies", value=f"{len(movies)} movies available", inline=True)
         
         if i == 0:  # Only show this on first embed
@@ -347,7 +251,7 @@ async def add_movie(interaction: discord.Interaction, name: str, google_drive_ur
         description=f"**{name}** has been added to the movie list.",
         color=0x00ff00
     )
-    embed.add_field(name="Usage", value=f"Use `/play {name}` to stream this movie", inline=False)
+    embed.add_field(name="Usage", value=f"Use `/play {name}` to start a watch party with this movie", inline=False)
     embed.add_field(name="Total Movies", value=f"{len(movie_bot.movie_list)} movies now available", inline=True)
     embed.add_field(name="Direct Link", value=f"[Watch in Browser]({converted_url})", inline=False)
     await interaction.followup.send(embed=embed)
@@ -403,7 +307,7 @@ async def movie_info(interaction: discord.Interaction, movie: str):
     )
     embed.add_field(name="Google Drive URL", value=f"[View File]({movie_url})", inline=False)
     embed.add_field(name="Direct Stream URL", value=f"[Direct Link]({movie_bot.convert_drive_url(movie_url)})", inline=False)
-    embed.add_field(name="Play Command", value=f"`/play {movie_name}`", inline=False)
+    embed.add_field(name="Play Command", value=f"`/play {movie_name}` - Start watch party", inline=False)
     
     await interaction.response.send_message(embed=embed)
 
@@ -474,8 +378,6 @@ async def on_voice_state_update(member, before, after):
             if voice_client.channel and guild_id in movie_bot.current_streams:
                 human_members = [m for m in voice_client.channel.members if not m.bot]
                 if len(human_members) == 0:
-                    if voice_client.is_playing():
-                        voice_client.stop()
                     await voice_client.disconnect()
                     if guild_id in movie_bot.current_streams:
                         del movie_bot.current_streams[guild_id]
@@ -488,9 +390,7 @@ async def on_app_command_error(interaction: discord.Interaction, error: Exceptio
     
     error_msg = "❌ An error occurred!"
     
-    if "FFmpeg" in str(error):
-        error_msg = "❌ Audio streaming unavailable! FFmpeg is not installed on this server."
-    elif "HTTP" in str(error):
+    if "HTTP" in str(error):
         error_msg = "❌ Network error! Check if the Google Drive link is accessible."
     elif "permission" in str(error).lower():
         error_msg = "❌ Permission error! Make sure the Google Drive file is shared publicly."
