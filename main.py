@@ -143,7 +143,117 @@ async def on_ready():
     except Exception as e:
         logger.error(f"Failed to sync commands: {e}")
 
-
+@bot.tree.command(name="play", description="Get movie link and join voice channel for watch party")
+@app_commands.autocomplete(movie=movie_autocomplete)
+async def play_movie(interaction: discord.Interaction, movie: str):
+    """Start a movie watch party - bot joins voice channel and provides movie link"""
+    
+    # Check if user is in a voice channel
+    if not interaction.user.voice or not interaction.user.voice.channel:
+        await interaction.response.send_message("❌ You need to be in a voice channel to start a watch party!", ephemeral=True)
+        return
+    
+    # Get movie URL and exact name
+    movie_url = movie_bot.get_movie_url(movie)
+    exact_movie_name = movie_bot.find_movie_name(movie)
+    
+    if not movie_url or not exact_movie_name:
+        available_movies = ", ".join(movie_bot.list_movies()[:10])  # Show first 10
+        if not movie_bot.list_movies():
+            available_movies = "No movies available! Use `/add_movie` to add some."
+        elif len(movie_bot.list_movies()) > 10:
+            available_movies += f"... and {len(movie_bot.list_movies()) - 10} more"
+            
+        await interaction.response.send_message(
+            f"❌ Movie '{movie}' not found!\n**Available movies:** {available_movies}\n\n*Use the autocomplete feature by typing movie names!*", 
+            ephemeral=True
+        )
+        return
+    
+    # Check if bot is already in a voice channel in this guild
+    guild_id = interaction.guild_id
+    if guild_id in movie_bot.current_streams:
+        current_vc = movie_bot.current_streams[guild_id]
+        if current_vc.channel:
+            await interaction.response.send_message(f"❌ Already in voice channel **{current_vc.channel.name}**! Use `/stop` first.", ephemeral=True)
+            return
+    
+    await interaction.response.defer()
+    
+    try:
+        # Verify URL is accessible
+        if not await movie_bot.verify_url(movie_url):
+            embed = discord.Embed(
+                title="⚠️ Movie URL Issue",
+                description=f"**{exact_movie_name}** - The Google Drive link may not be publicly accessible.",
+                color=0xff9900
+            )
+            embed.add_field(
+                name="How to fix:",
+                value="1. Right-click the file in Google Drive\n2. Select 'Share'\n3. Change to 'Anyone with the link'\n4. Set permission to 'Viewer'",
+                inline=False
+            )
+            embed.add_field(name="Try anyway?", value=f"[Direct Link]({movie_url})", inline=False)
+            await interaction.followup.send(embed=embed)
+            return
+        
+        # Join voice channel
+        voice_channel = interaction.user.voice.channel
+        voice_client = await voice_channel.connect()
+        
+        # Store the voice client reference
+        movie_bot.current_streams[guild_id] = voice_client
+        
+        # Create watch party embed
+        embed = discord.Embed(
+            title="🎬 Movie Watch Party Started!",
+            description=f"**Movie:** {exact_movie_name}\n**Voice Channel:** {voice_channel.name}",
+            color=0x00ff00
+        )
+        
+        embed.add_field(
+            name="🔗 Watch Here",
+            value=f"[**Click to Open Movie**]({movie_url})\n*Everyone click this link to watch together!*",
+            inline=False
+        )
+        
+        embed.add_field(
+            name="📋 Instructions",
+            value="1. **Everyone** click the movie link above\n2. **Stay** in the voice channel to chat\n3. **Coordinate** play/pause in voice chat\n4. Use `/stop` when done",
+            inline=False
+        )
+        
+        embed.add_field(
+            name="💡 Pro Tips",
+            value="• Use Discord's screen share for better sync\n• Nominate someone as the 'play button coordinator'\n• Use voice chat for reactions and commentary!",
+            inline=False
+        )
+        
+        embed.set_footer(text="🤖 Bot will stay in voice channel until everyone leaves or /stop is used")
+        
+        await interaction.followup.send(embed=embed)
+        
+        # Send a follow-up message with just the clean link
+        await interaction.followup.send(
+            f"🎥 **Direct Movie Link:** {movie_url}\n\n*Copy this link if needed!*",
+            ephemeral=False
+        )
+        
+    except discord.errors.ClientException as e:
+        if "already connected" in str(e).lower():
+            await interaction.followup.send("❌ Bot is already connected to a voice channel in this server!")
+        else:
+            await interaction.followup.send(f"❌ Could not join voice channel: {str(e)}")
+    except Exception as e:
+        logger.error(f"Error starting watch party: {e}")
+        if guild_id in movie_bot.current_streams:
+            del movie_bot.current_streams[guild_id]
+        try:
+            if 'voice_client' in locals():
+                await voice_client.disconnect()
+        except:
+            pass
+        await interaction.followup.send(f"❌ Error starting watch party: {str(e)}")
 
 @bot.tree.command(name="stop", description="End watch party and leave voice channel")
 async def stop_movie(interaction: discord.Interaction):
@@ -184,7 +294,7 @@ async def list_movies(interaction: discord.Interaction):
             description="No movies have been added yet!",
             color=0xff9900
         )
-        embed.add_field(name="How to add movies:", value="Use `/add_movie <name> <google_drive_url>`", inline=False)
+        embed.add_field(name="How to add movies:", value="Use `/add_movie <n> <google_drive_url>`", inline=False)
         embed.add_field(name="Example:", value="`/add_movie Superman https://drive.google.com/file/d/abc123...`", inline=False)
         await interaction.response.send_message(embed=embed)
         return
@@ -317,19 +427,19 @@ async def help_command(interaction: discord.Interaction):
     
     embed = discord.Embed(
         title="🎬 Discord Movie Bot Help",
-        description="Stream movies from Google Drive to Discord voice channels!",
+        description="Start movie watch parties with friends in Discord voice channels!",
         color=0x0099ff
     )
     
     embed.add_field(
         name="🎵 Basic Commands",
-        value="`/play <movie>` - Play a movie (with autocomplete!)\n`/stop` - Stop playback\n`/movies` - List available movies",
+        value="`/play <movie>` - Start a watch party (with autocomplete!)\n`/stop` - End watch party and leave voice\n`/movies` - List available movies",
         inline=False
     )
     
     embed.add_field(
         name="🔧 Admin Commands",
-        value="`/add_movie <name> <url>` - Add movie\n`/remove_movie <name>` - Remove movie\n`/movie_info <name>` - Movie details",
+        value="`/add_movie <n> <url>` - Add movie\n`/remove_movie <n>` - Remove movie\n`/movie_info <n>` - Movie details",
         inline=False
     )
     
@@ -340,18 +450,24 @@ async def help_command(interaction: discord.Interaction):
     )
     
     embed.add_field(
-        name="✨ Features",
-        value="• **Autocomplete**: Type `/play` and see movie suggestions!\n• **Better search**: Case-insensitive movie matching\n• **Direct links**: Get browser-viewable movie links\n• **Auto-cleanup**: Bot leaves when channel is empty",
+        name="🍿 How Watch Parties Work",
+        value="1. Use `/play MovieName` while in a voice channel\n2. Bot joins and provides movie link\n3. Everyone clicks the link to watch\n4. Stay in voice to chat during the movie!\n5. Use `/stop` when done",
         inline=False
     )
     
     embed.add_field(
-        name="⚠️ Important Notes",
-        value="• Audio streaming requires FFmpeg (may not be available on all servers)\n• Files must be publicly accessible on Google Drive\n• Supported: MP4, MKV, AVI, etc.\n• Fallback: Direct browser links provided if streaming unavailable",
+        name="✨ Features",
+        value="• **No FFmpeg needed**: Direct Google Drive links\n• **Watch together**: Everyone gets the same link\n• **Voice chat**: Perfect for reactions and commentary\n• **Auto-cleanup**: Bot leaves when channel is empty\n• **Autocomplete**: Easy movie selection",
         inline=False
     )
     
-    embed.set_footer(text="Made for streaming movie audio to Discord voice channels")
+    embed.add_field(
+        name="⚠️ Requirements",
+        value="• Files must be publicly accessible on Google Drive\n• Everyone needs to click the provided link\n• Coordinate play/pause through voice chat\n• Works with MP4, MKV, AVI, etc.",
+        inline=False
+    )
+    
+    embed.set_footer(text="Perfect for movie nights with friends! 🎭")
     
     await interaction.response.send_message(embed=embed)
 
