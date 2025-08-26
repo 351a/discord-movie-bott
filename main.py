@@ -1,5 +1,6 @@
 import discord
 from discord.ext import commands
+from discord import app_commands
 import asyncio
 import os
 import json
@@ -68,10 +69,18 @@ class MovieBot:
     
     def get_movie_url(self, movie_name: str) -> str:
         """Get movie URL by name (case insensitive)"""
-        movie_name = movie_name.lower().replace(" ", "").replace("-", "")
+        movie_name = movie_name.lower().replace(" ", "").replace("-", "").replace("_", "")
         for key, url in self.movie_list.items():
-            if key.lower().replace(" ", "").replace("-", "") == movie_name:
+            if key.lower().replace(" ", "").replace("-", "").replace("_", "") == movie_name:
                 return self.convert_drive_url(url)
+        return None
+    
+    def find_movie_name(self, movie_name: str) -> str:
+        """Find exact movie name from partial match"""
+        movie_name = movie_name.lower().replace(" ", "").replace("-", "").replace("_", "")
+        for key in self.movie_list.keys():
+            if key.lower().replace(" ", "").replace("-", "").replace("_", "") == movie_name:
+                return key
         return None
     
     def list_movies(self) -> List[str]:
@@ -82,12 +91,45 @@ class MovieBot:
         """Verify if the Google Drive URL is accessible"""
         try:
             async with aiohttp.ClientSession() as session:
-                async with session.head(url, allow_redirects=True) as response:
+                async with session.head(url, allow_redirects=True, timeout=10) as response:
                     return response.status in [200, 206]  # 206 for partial content
         except:
             return False
 
 movie_bot = MovieBot()
+
+# Autocomplete function for movie names
+async def movie_autocomplete(
+    interaction: discord.Interaction,
+    current: str,
+) -> List[app_commands.Choice[str]]:
+    movies = movie_bot.list_movies()
+    if not current:
+        # Return first 25 movies if no input
+        return [
+            app_commands.Choice(name=movie, value=movie)
+            for movie in movies[:25]
+        ]
+    
+    # Filter movies that start with or contain the current input
+    filtered = []
+    current_lower = current.lower()
+    
+    # First, add movies that start with the input
+    for movie in movies:
+        if movie.lower().startswith(current_lower):
+            filtered.append(movie)
+    
+    # Then, add movies that contain the input but don't start with it
+    for movie in movies:
+        if current_lower in movie.lower() and not movie.lower().startswith(current_lower):
+            filtered.append(movie)
+    
+    # Return first 25 matches
+    return [
+        app_commands.Choice(name=movie, value=movie)
+        for movie in filtered[:25]
+    ]
 
 @bot.event
 async def on_ready():
@@ -102,6 +144,7 @@ async def on_ready():
         logger.error(f"Failed to sync commands: {e}")
 
 @bot.tree.command(name="play", description="Play a movie from Google Drive in voice channel")
+@app_commands.autocomplete(movie=movie_autocomplete)
 async def play_movie(interaction: discord.Interaction, movie: str):
     """Play a movie in the user's voice channel"""
     
@@ -110,14 +153,19 @@ async def play_movie(interaction: discord.Interaction, movie: str):
         await interaction.response.send_message("❌ You need to be in a voice channel to use this command!", ephemeral=True)
         return
     
-    # Get movie URL
+    # Get movie URL and exact name
     movie_url = movie_bot.get_movie_url(movie)
-    if not movie_url:
-        available_movies = ", ".join(movie_bot.list_movies())
-        if not available_movies:
+    exact_movie_name = movie_bot.find_movie_name(movie)
+    
+    if not movie_url or not exact_movie_name:
+        available_movies = ", ".join(movie_bot.list_movies()[:10])  # Show first 10
+        if not movie_bot.list_movies():
             available_movies = "No movies available! Use `/add_movie` to add some."
+        elif len(movie_bot.list_movies()) > 10:
+            available_movies += f"... and {len(movie_bot.list_movies()) - 10} more"
+            
         await interaction.response.send_message(
-            f"❌ Movie '{movie}' not found!\n**Available movies:** {available_movies}", 
+            f"❌ Movie '{movie}' not found!\n**Available movies:** {available_movies}\n\n*Use the autocomplete feature by typing movie names!*", 
             ephemeral=True
         )
         return
@@ -164,7 +212,7 @@ async def play_movie(interaction: discord.Interaction, movie: str):
         
         embed = discord.Embed(
             title="🎬 Now Playing",
-            description=f"**Movie:** {movie.title()}\n**Channel:** {voice_channel.name}",
+            description=f"**Movie:** {exact_movie_name}\n**Channel:** {voice_channel.name}",
             color=0x00ff00
         )
         embed.add_field(name="🎵", value="Streaming audio from Google Drive", inline=False)
@@ -182,7 +230,7 @@ async def play_movie(interaction: discord.Interaction, movie: str):
                 await voice_client.disconnect()
         except:
             pass
-        await interaction.followup.send(f"❌ Error playing movie: {str(e)}\n*Make sure the Google Drive link is publicly accessible!*")
+        await interaction.followup.send(f"❌ Error playing movie: {str(e)}\n*Make sure the Google Drive link is publicly accessible and FFmpeg is installed!*")
 
 @bot.tree.command(name="stop", description="Stop current movie playback")
 async def stop_movie(interaction: discord.Interaction):
@@ -230,7 +278,8 @@ async def list_movies(interaction: discord.Interaction):
             description="\n".join([f"• **{movie}**" for movie in chunk]),
             color=0x0099ff
         )
-        embed.add_field(name="Usage", value="Use `/play <movie_name>` to play a movie", inline=False)
+        embed.add_field(name="Usage", value="Use `/play <movie_name>` to play a movie (with autocomplete!)", inline=False)
+        embed.add_field(name="Total Movies", value=f"{len(movies)} movies available", inline=True)
         
         if i == 0:  # Only show this on first embed
             await interaction.response.send_message(embed=embed)
@@ -274,15 +323,20 @@ async def add_movie(interaction: discord.Interaction, name: str, google_drive_ur
     movie_bot.movie_list[movie_key] = google_drive_url
     movie_bot.save_movie_list(movie_bot.movie_list)
     
+    # Reload the movie list to ensure it's updated
+    movie_bot.movie_list = movie_bot.load_movie_list()
+    
     embed = discord.Embed(
         title="✅ Movie Added Successfully!",
         description=f"**{name}** has been added to the movie list.",
         color=0x00ff00
     )
     embed.add_field(name="Usage", value=f"Use `/play {name}` to stream this movie", inline=False)
+    embed.add_field(name="Total Movies", value=f"{len(movie_bot.movie_list)} movies now available", inline=True)
     await interaction.followup.send(embed=embed)
 
 @bot.tree.command(name="remove_movie", description="Remove a movie from the list")
+@app_commands.autocomplete(name=movie_autocomplete)
 async def remove_movie(interaction: discord.Interaction, name: str):
     """Remove a movie from the available list"""
     
@@ -308,6 +362,7 @@ async def remove_movie(interaction: discord.Interaction, name: str):
     await interaction.response.send_message(f"✅ Removed movie '{movie_key}' from the list!")
 
 @bot.tree.command(name="movie_info", description="Get information about a specific movie")
+@app_commands.autocomplete(movie=movie_autocomplete)
 async def movie_info(interaction: discord.Interaction, movie: str):
     """Get information about a specific movie"""
     
@@ -315,7 +370,7 @@ async def movie_info(interaction: discord.Interaction, movie: str):
     movie_url = None
     movie_name = None
     for key, url in movie_bot.movie_list.items():
-        if key.lower().replace(" ", "").replace("-", "") == movie.lower().replace(" ", "").replace("-", ""):
+        if key.lower().replace(" ", "").replace("-", "").replace("_", "") == movie.lower().replace(" ", "").replace("-", "").replace("_", ""):
             movie_url = url
             movie_name = key
             break
@@ -347,7 +402,7 @@ async def help_command(interaction: discord.Interaction):
     
     embed.add_field(
         name="🎵 Basic Commands",
-        value="`/play <movie>` - Play a movie\n`/stop` - Stop playback\n`/movies` - List available movies",
+        value="`/play <movie>` - Play a movie (with autocomplete!)\n`/stop` - Stop playback\n`/movies` - List available movies",
         inline=False
     )
     
@@ -360,6 +415,12 @@ async def help_command(interaction: discord.Interaction):
     embed.add_field(
         name="📁 Adding Movies from Google Drive",
         value="1. Upload video to Google Drive\n2. Right-click → Share → 'Anyone with link'\n3. Copy the share URL\n4. Use `/add_movie MovieName <URL>`",
+        inline=False
+    )
+    
+    embed.add_field(
+        name="✨ New Features",
+        value="• **Autocomplete**: Type `/play` and see movie suggestions!\n• **Better search**: Case-insensitive movie matching\n• **Instant updates**: Movies appear immediately after adding",
         inline=False
     )
     
@@ -410,7 +471,7 @@ async def on_app_command_error(interaction: discord.Interaction, error: Exceptio
     error_msg = "❌ An error occurred!"
     
     if "FFmpeg" in str(error):
-        error_msg = "❌ Audio processing error! The movie file might be corrupted or in an unsupported format."
+        error_msg = "❌ Audio processing error! FFmpeg might not be installed or the movie file is corrupted."
     elif "HTTP" in str(error):
         error_msg = "❌ Network error! Check if the Google Drive link is accessible."
     elif "permission" in str(error).lower():
